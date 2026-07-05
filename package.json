@@ -1,0 +1,26 @@
+{
+  "name": "jspixelize",
+  "private": true,
+  "scripts": {
+    "clean": "rimraf dist",
+    "typecheck": "pnpm tsc --noEmit",
+    "pretest": "pnpm typecheck && pnpm lint",
+    "lint": "oxlint .",
+    "lint:fix": "oxlint --fix",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@types/node": "26.0.1",
+    "ajv": "8.20.0",
+    "oxfmt": "0.56.0",
+    "oxlint": "1.71.0",
+    "rimraf": "6.1.3",
+    "typescript": "7.0.1-rc",
+    "vite": "8.1.0",
+    "vitest": "4.1.9"
+  }
+}
