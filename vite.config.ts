@@ -1,4 +1,3 @@
-import { writeFileSync } from "node:fs";
 import { defineConfig } from "vite";
 
 export default defineConfig({
@@ -7,14 +6,6 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     target: "esnext",
-    minify: "esbuild",
+    minify: "oxc",
   },
-  plugins: [
-    {
-      name: "create-nojekyll",
-      closeBundle() {
-        writeFileSync("dist/.nojekyll", "");
-      },
-    },
-  ],
 });
