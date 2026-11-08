@@ -506,18 +506,21 @@ export class PixelizerApp extends HTMLElement {
           font-weight: normal;
           font-size: 0.9em;
           color: var(--text-color);
+          cursor: pointer;
         }
         .pixelize-label {
           display: flex;
           align-items: center;
           font-weight: 600;
           color: var(--text-color);
+          cursor: pointer;
         }
         input[type="checkbox"] {
           margin-right: 8px;
           width: 1.1em;
           height: 1.1em;
           accent-color: var(--input-focus-border-color);
+          cursor: pointer;
         }
         .radio-group {
           display: flex;
@@ -529,6 +532,7 @@ export class PixelizerApp extends HTMLElement {
           align-items: center;
           gap: 4px;
           font-size: 0.9em;
+          cursor: pointer;
         }
         input[type="radio"] {
           accent-color: var(--input-focus-border-color);
@@ -612,7 +616,7 @@ export class PixelizerApp extends HTMLElement {
           }
         }
         .hidden {
-          display: none;
+          display: none !important;
         }
         @media (max-width: 900px) {
           :host {
@@ -805,8 +809,30 @@ export class PixelizerApp extends HTMLElement {
               max="2.0"
               value="0.0"
               step="0.05"
-              helper="Positive values prefer darker colors. Negative values prefer lighter colors."
+              helper="0.0 = completely neutral. Positive = prefer darker colors. Negative = prefer lighter colors."
             ></synced-slider>
+
+            <div class="control-group">
+              <label class="checkbox-label">
+                <input type="checkbox" id="preserve-details" checked />
+                Preserve Text / Fine Details
+              </label>
+              <small
+                >Detects high-contrast strokes (text, line art) to prevent them
+                from being erased during downscaling.</small
+              >
+            </div>
+
+        <synced-slider
+  id="preserve-strength-ctrl"
+  label="Detail Protection Strength"
+  min="1"
+  max="10"
+  value="5"
+  step="0.5"
+  helper="1 = delicate/subtle (sharpest text only), 5 = balanced, 10 = bold (bridges character gaps & catches subtle text)."
+></synced-slider>
+            </div>
           </div>
         </div>
 
@@ -879,6 +905,19 @@ export class PixelizerApp extends HTMLElement {
       pixelizationOptions?.classList.toggle(
         "hidden",
         !enablePixelizationCheckbox.checked,
+      );
+    });
+
+    const preserveDetailsCheckbox = this.shadowRoot!.querySelector(
+      "#preserve-details",
+    ) as HTMLInputElement;
+    const detailStrengthContainer = this.shadowRoot!.querySelector(
+      "#detail-strength-container",
+    ) as HTMLElement;
+    preserveDetailsCheckbox?.addEventListener("change", () => {
+      detailStrengthContainer?.classList.toggle(
+        "hidden",
+        !preserveDetailsCheckbox.checked,
       );
     });
 
@@ -1076,6 +1115,16 @@ export class PixelizerApp extends HTMLElement {
       ) as HTMLInputElement;
       const noDownscale = !!noDownscaleCheckbox?.checked;
 
+      const preserveDetailsCheckbox = this.shadowRoot!.querySelector(
+        "#preserve-details",
+      ) as HTMLInputElement;
+      const preserveDetails = !!preserveDetailsCheckbox?.checked;
+
+      const preserveStrengthCtrl = this.shadowRoot!.querySelector(
+        "#preserve-strength-ctrl",
+      ) as SyncedSlider;
+      const preserveStrength = preserveStrengthCtrl?.value ?? 5;
+
       this.updateStatus("Processing...");
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
 
@@ -1098,6 +1147,8 @@ export class PixelizerApp extends HTMLElement {
         fixPaletteData,
         noDownscale,
         customPaletteStr,
+        preserveDetails,
+        preserveStrength,
       };
 
       const result = this.processor.processImage(mainImageData, options);

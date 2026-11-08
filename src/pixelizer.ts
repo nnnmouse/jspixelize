@@ -5,7 +5,8 @@ export type RawImageData = {
 };
 
 type RGBColor = [number, number, number];
-type LABColor = [number, number, number];
+type RGBAColor = [number, number, number, number];
+type LABColor = [number, number, number, number?]; // [L, a, b]
 type Palette = RGBColor[];
 
 export type PixelizerOptions = {
@@ -18,6 +19,8 @@ export type PixelizerOptions = {
   fixPaletteData: RawImageData | null;
   noDownscale: boolean;
   customPaletteStr: string;
+  preserveDetails: boolean;
+  preserveStrength: number;
 };
 
 export type PixelizerResults = {
@@ -91,15 +94,151 @@ export class PixelizerGenerator {
     return dl * dl + da * da + db * db;
   }
 
-  sampleLabPixels(imageData: RawImageData, maxSamples: number): LABColor[] {
+  /**
+   * Detects high-contrast strokes (text, line art, thin details) using local contrast.
+   * Dynamic threshold & stroke expansion adapt smoothly to preserveStrength (1 to 10).
+   */
+  generateHighContrastMask(
+    imageData: RawImageData,
+    preserveStrength = 5.0,
+  ): Float32Array {
+    const { width: w, height: h, data } = imageData;
+    const n = w * h;
+    const lum = new Float32Array(n);
+    let mask = new Float32Array(n);
+
+    for (let i = 0; i < n; i++) {
+      const idx = i * 4;
+      const a = data[idx + 3]!;
+      if (a < 128) {
+        lum[i] = -1; // Ignore transparent pixels
+      } else {
+        lum[i] =
+          0.2126 * data[idx]! +
+          0.7152 * data[idx + 1]! +
+          0.0722 * data[idx + 2]!;
+      }
+    }
+
+    // Separable 5x5 box filter (radius = 2) for local mean luminance
+    const R = 2;
+    const hMean = new Float32Array(n);
+    for (let y = 0; y < h; y++) {
+      const yOff = y * w;
+      for (let x = 0; x < w; x++) {
+        let sum = 0;
+        let count = 0;
+        const x0 = Math.max(0, x - R);
+        const x1 = Math.min(w - 1, x + R);
+        for (let xi = x0; xi <= x1; xi++) {
+          const l = lum[yOff + xi]!;
+          if (l >= 0) {
+            sum += l;
+            count++;
+          }
+        }
+        hMean[yOff + x] = count > 0 ? sum / count : Math.max(0, lum[yOff + x]!);
+      }
+    }
+
+    // Dynamic contrast threshold governed by preserveStrength:
+    // Strength 1 -> ~46 (only extreme stark contrast)
+    // Strength 5 -> ~28 (balanced text & outlines)
+    // Strength 10 -> ~8 (subtle contrast, colored text, thin serifs)
+    const threshold = Math.max(8, 50.0 - preserveStrength * 4.2);
+
+    for (let x = 0; x < w; x++) {
+      for (let y = 0; y < h; y++) {
+        const idx = y * w + x;
+        const l = lum[idx]!;
+        if (l < 0) continue;
+        let sum = 0;
+        let count = 0;
+        const y0 = Math.max(0, y - R);
+        const y1 = Math.min(h - 1, y + R);
+        for (let yi = y0; yi <= y1; yi++) {
+          sum += hMean[yi * w + x]!;
+          count++;
+        }
+        const mean = count > 0 ? sum / count : l;
+        const contrast = Math.abs(l - mean);
+
+        if (contrast >= threshold) {
+          // Continuous weight based on contrast magnitude
+          const excess = contrast - threshold;
+          mask[idx] = Math.min(1.0, 0.25 + excess / 40.0);
+        }
+      }
+    }
+
+    // At higher strengths (> 5), perform soft stroke dilation to prevent
+    // broken characters and reinforce thin letters into contiguous pixel art
+    if (preserveStrength > 5.0) {
+      const dilateFactor = (preserveStrength - 5.0) / 5.0; // 0.0 to 1.0
+      const dilated = new Float32Array(mask);
+      for (let y = 1; y < h - 1; y++) {
+        const yOff = y * w;
+        for (let x = 1; x < w - 1; x++) {
+          const idx = yOff + x;
+          const m = mask[idx]!;
+          if (m > 0.3) {
+            const spread = m * 0.65 * dilateFactor;
+            if (spread > dilated[idx - 1]!) dilated[idx - 1] = spread;
+            if (spread > dilated[idx + 1]!) dilated[idx + 1] = spread;
+            if (spread > dilated[idx - w]!) dilated[idx - w] = spread;
+            if (spread > dilated[idx + w]!) dilated[idx + w] = spread;
+          }
+        }
+      }
+      mask = dilated;
+    }
+
+    return mask;
+  }
+
+  sampleLabPixels(
+    imageData: RawImageData,
+    maxSamples: number,
+    noDownscale = false,
+    protectedMask: Float32Array | null = null,
+  ): LABColor[] {
     const pixels: LABColor[] = [];
     const data = imageData.data;
     const total = data.length / 4;
-    const samplingRate = Math.max(1, Math.floor(total / maxSamples));
+
+    const effectiveMaxSamples = noDownscale ? 60000 : maxSamples;
+    const samplingRate = Math.max(1, Math.floor(total / effectiveMaxSamples));
+
     for (let i = 0; i < data.length; i += 4 * samplingRate) {
-      if (data[i + 3]! > 0)
+      if (data[i + 3]! > 128) {
         pixels.push(this.rgbToLab([data[i]!, data[i + 1]!, data[i + 2]!]));
+      }
     }
+
+    // Inject protected detail pixels so text colors survive K-Means clustering
+    if (protectedMask) {
+      const protectedIndices: number[] = [];
+      for (let i = 0; i < total; i++) {
+        if (protectedMask[i]! > 0.25 && data[i * 4 + 3]! > 128) {
+          protectedIndices.push(i);
+        }
+      }
+
+      if (protectedIndices.length > 0) {
+        const sampleLimit = Math.min(protectedIndices.length, 2500);
+        const step = Math.max(
+          1,
+          Math.floor(protectedIndices.length / sampleLimit),
+        );
+        for (let i = 0; i < protectedIndices.length; i += step) {
+          const idx = protectedIndices[i]! * 4;
+          pixels.push(
+            this.rgbToLab([data[idx]!, data[idx + 1]!, data[idx + 2]!]),
+          );
+        }
+      }
+    }
+
     return pixels;
   }
 
@@ -239,126 +378,143 @@ export class PixelizerGenerator {
     return { data: outData, width: newWidth, height: newHeight };
   }
 
+  /**
+   * 2D Cell Mode Downscale with continuous detail weighting.
+   */
   modeDownscale(
     imageData: RawImageData,
     outW: number,
     outH: number,
-    nColors = 64,
     weightC = 0.0,
+    protectedMask: Float32Array | null = null,
+    preserveStrength = 0.0,
   ): RawImageData {
     const inData = imageData.data;
     const inW = imageData.width;
     const inH = imageData.height;
     if (outW === inW && outH === inH) return { ...imageData };
 
-    type RGBAColor = [number, number, number, number];
-    const selectDominantPixel = (
-      colors: RGBAColor[],
-      counts: number[],
-      used: number,
-    ): RGBAColor => {
-      if (used === 0) return [0, 0, 0, 0];
-      let bestIdx = 0,
-        bestScore = -Infinity,
-        bestLum = Infinity;
-      for (let i = 0; i < used; i++) {
-        const color = colors[i]!;
-        const count = counts[i]!;
-        const lum = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
-        const score = count * (1.0 + weightC * (1.0 - lum / 255.0));
-        if (
-          score > bestScore ||
-          (Math.abs(score - bestScore) < 1e-6 && lum < bestLum)
-        ) {
-          bestScore = score;
-          bestIdx = i;
-          bestLum = lum;
-        }
-      }
-      return colors[bestIdx]!;
-    };
-
-    const verticalData = new Uint8ClampedArray(inW * outH * 4);
-    const scaleY = inH / outH;
-    for (let x = 0; x < inW; x++) {
-      for (let yOut = 0; yOut < outH; yOut++) {
-        const yStart = Math.floor(yOut * scaleY);
-        const yEnd = Math.min(inH, Math.ceil((yOut + 1) * scaleY));
-        const colors: RGBAColor[] = [],
-          counts: number[] = [];
-        let used = 0;
-        for (let y = yStart; y < yEnd; y++) {
-          const idx = (y * inW + x) * 4;
-          const r = inData[idx]!,
-            g = inData[idx + 1]!,
-            b = inData[idx + 2]!,
-            a = inData[idx + 3]!;
-          let found = -1;
-          for (let i = 0; i < used; i++) {
-            if (
-              colors[i]![0] === r &&
-              colors[i]![1] === g &&
-              colors[i]![2] === b &&
-              colors[i]![3] === a
-            ) {
-              found = i;
-              break;
-            }
-          }
-          if (found !== -1) counts[found]!++;
-          else if (used < nColors) {
-            colors.push([r, g, b, a]);
-            counts.push(1);
-            used++;
-          }
-        }
-        verticalData.set(
-          selectDominantPixel(colors, counts, used),
-          (yOut * inW + x) * 4,
-        );
-      }
-    }
-
     const outData = new Uint8ClampedArray(outW * outH * 4);
     const scaleX = inW / outW;
+    const scaleY = inH / outH;
+
+    type CellEntry = {
+      color: RGBAColor;
+      lum: number;
+      count: number;
+      protectedWeightSum: number;
+    };
+
     for (let yOut = 0; yOut < outH; yOut++) {
+      const yStart = Math.floor(yOut * scaleY);
+      const yEnd = Math.min(
+        inH,
+        Math.max(yStart + 1, Math.floor((yOut + 1) * scaleY)),
+      );
+
       for (let xOut = 0; xOut < outW; xOut++) {
         const xStart = Math.floor(xOut * scaleX);
-        const xEnd = Math.min(inW, Math.ceil((xOut + 1) * scaleX));
-        const colors: RGBAColor[] = [],
-          counts: number[] = [];
-        let used = 0;
-        for (let x = xStart; x < xEnd; x++) {
-          const vIdx = (yOut * inW + x) * 4;
-          const r = verticalData[vIdx]!,
-            g = verticalData[vIdx + 1]!,
-            b = verticalData[vIdx + 2]!,
-            a = verticalData[vIdx + 3]!;
-          let found = -1;
-          for (let i = 0; i < used; i++) {
-            if (
-              colors[i]![0] === r &&
-              colors[i]![1] === g &&
-              colors[i]![2] === b &&
-              colors[i]![3] === a
-            ) {
-              found = i;
-              break;
+        const xEnd = Math.min(
+          inW,
+          Math.max(xStart + 1, Math.floor((xOut + 1) * scaleX)),
+        );
+        const cellArea = (yEnd - yStart) * (xEnd - xStart);
+
+        const cellMap = new Map<number, CellEntry>();
+        let transparentCount = 0;
+        let totalCount = 0;
+
+        for (let y = yStart; y < yEnd; y++) {
+          const yOff = y * inW;
+          for (let x = xStart; x < xEnd; x++) {
+            totalCount++;
+            const idx = (yOff + x) * 4;
+            const a = inData[idx + 3]!;
+
+            if (a < 128) {
+              transparentCount++;
+              continue;
+            }
+
+            const r = inData[idx]!;
+            const g = inData[idx + 1]!;
+            const b = inData[idx + 2]!;
+            const key = (r << 16) | (g << 8) | b;
+
+            const protWeight = protectedMask ? protectedMask[yOff + x]! : 0;
+            let entry = cellMap.get(key);
+            if (!entry) {
+              const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+              entry = {
+                color: [r, g, b, a],
+                lum,
+                count: 0,
+                protectedWeightSum: 0,
+              };
+              cellMap.set(key, entry);
+            }
+            entry.count++;
+            if (protWeight > 0) {
+              entry.protectedWeightSum += protWeight;
             }
           }
-          if (found !== -1) counts[found]!++;
-          else if (used < nColors) {
-            colors.push([r, g, b, a]);
-            counts.push(1);
-            used++;
+        }
+
+        const destIdx = (yOut * outW + xOut) * 4;
+
+        if (transparentCount > totalCount / 2 || cellMap.size === 0) {
+          outData[destIdx] = 0;
+          outData[destIdx + 1] = 0;
+          outData[destIdx + 2] = 0;
+          outData[destIdx + 3] = 0;
+          continue;
+        }
+
+        let bestColor: RGBAColor = [0, 0, 0, 255];
+        let bestScore = -Infinity;
+        let bestLum = Infinity;
+
+        // Boost factor scales smoothly from mild (at 1) to bold/unbreakable (at 10)
+        const boostPower =
+          preserveStrength > 0
+            ? Math.pow(preserveStrength / 5.0, 1.4) * 1.6
+            : 0;
+
+        for (const entry of cellMap.values()) {
+          const normalizedLum = entry.lum / 255.0;
+          const preference = Math.exp((weightC / 2) * (0.5 - normalizedLum));
+          let score = entry.count * preference;
+
+          if (entry.protectedWeightSum > 0 && preserveStrength > 0) {
+            // Protected boost accounts for stroke strength and cell size
+            score +=
+              entry.protectedWeightSum * preference * cellArea * boostPower;
+          }
+
+          const prefersTie =
+            weightC > 1e-4
+              ? entry.lum < bestLum
+              : weightC < -1e-4
+                ? entry.lum > bestLum
+                : false;
+
+          if (
+            score > bestScore ||
+            (Math.abs(score - bestScore) < 1e-6 && prefersTie)
+          ) {
+            bestScore = score;
+            bestColor = entry.color;
+            bestLum = entry.lum;
           }
         }
-        outData.set(
-          selectDominantPixel(colors, counts, used),
-          (yOut * outW + xOut) * 4,
-        );
+
+        outData[destIdx] = bestColor[0];
+        outData[destIdx + 1] = bestColor[1];
+        outData[destIdx + 2] = bestColor[2];
+        outData[destIdx + 3] = bestColor[3];
       }
     }
+
     return { data: outData, width: outW, height: outH };
   }
 
@@ -369,11 +525,26 @@ export class PixelizerGenerator {
     const { width: origW, height: origH } = mainImageData;
     let paletteRGB: Palette;
 
+    let protectedMask: Float32Array | null = null;
+    if (options.preserveDetails) {
+      protectedMask = this.generateHighContrastMask(
+        mainImageData,
+        options.preserveStrength,
+      );
+    }
+
     if (options.paletteMode === "custom") {
       paletteRGB = this.parseCustomPalette(options.customPaletteStr);
     } else {
       const paletteSourceData = options.fixPaletteData || mainImageData;
-      const labPixels = this.sampleLabPixels(paletteSourceData, 5000);
+      const maskForPalette = options.fixPaletteData ? null : protectedMask;
+
+      const labPixels = this.sampleLabPixels(
+        paletteSourceData,
+        5000,
+        options.noDownscale,
+        maskForPalette,
+      );
       if (labPixels.length === 0)
         throw new Error(
           "No non-transparent pixels found for palette generation.",
@@ -403,8 +574,9 @@ export class PixelizerGenerator {
         quantizedImageData,
         downW,
         downH,
-        options.nColors,
         options.weightC,
+        protectedMask,
+        options.preserveDetails ? options.preserveStrength : 0,
       );
 
       let finalW = origW;
